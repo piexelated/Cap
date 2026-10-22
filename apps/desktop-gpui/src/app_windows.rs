@@ -2427,44 +2427,40 @@ fn open_overlay(
         None
     };
     #[cfg(target_os = "linux")]
-    let window_bounds = if overlay_display.is_some() {
-        WindowBounds::Fullscreen(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(width as f32), px(height as f32)),
-        })
-    } else {
-        window_bounds
-    };
+    let display_id = overlay_display.as_ref().map(|display| display.id());
+    #[cfg(target_os = "windows")]
+    let display_id = gpui_display_id(Some(display), cx);
+    #[cfg(target_os = "macos")]
+    let display_id: Option<gpui::DisplayId> = None;
 
-    let handle = cx.open_window(
-        WindowOptions {
-            // The origin is corrected right after opening -- gpui's own
-            // window-origin math cannot express "cover this display" (see
-            // `platform::set_window_frame_cg`). The size is honoured, and it is
-            // the size the renderer is built for.
-            window_bounds: Some(window_bounds),
-            #[cfg(target_os = "linux")]
-            display_id: overlay_display.as_ref().map(|display| display.id()),
-            #[cfg(target_os = "windows")]
-            display_id: gpui_display_id(Some(display), cx),
-            titlebar: None,
-            // `NSWindowStyleMaskNonActivatingPanel` in windows.rs: the overlay
-            // takes clicks without activating the app over the one being
-            // recorded.
-            kind: WindowKind::PopUp,
-            focus: false,
-            // Shown once it has been moved onto its display, so it never
-            // paints a frame in the wrong place.
-            show: false,
-            is_resizable: false,
-            is_minimizable: false,
-            window_background: gpui::WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        },
-        {
-            let display = *display;
-            move |window, cx| cx.new(|cx| OverlayWindow::new(&display, select, window, cx))
-        },
+    #[cfg(target_os = "linux")]
+    let handle = if overlay_display.is_some() {
+        open_wayland_overlay_window(
+            display,
+            &select,
+            size(px(width as f32), px(height as f32)),
+            display_id,
+            focus,
+            cx,
+        )
+    } else {
+        open_overlay_window(
+            display,
+            &select,
+            WindowKind::PopUp,
+            window_bounds,
+            display_id,
+            cx,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let handle = open_overlay_window(
+        display,
+        &select,
+        WindowKind::PopUp,
+        window_bounds,
+        display_id,
+        cx,
     );
 
     match handle {
@@ -2528,6 +2524,96 @@ fn open_overlay(
         }
         Err(error) => tracing::error!("target select overlay failed to open: {error:#}"),
     }
+}
+
+// Tiling compositors such as niri give a fullscreen toplevel its own slot over
+// a black backdrop, so the transparent picker showed only black there. A
+// layer-shell overlay sits above every window instead; its exclusive zone of
+// -1 also covers panels so overlay coordinates match the captured display.
+// Compositors without layer-shell (GNOME) keep the fullscreen toplevel.
+#[cfg(target_os = "linux")]
+fn open_wayland_overlay_window(
+    display: &scap_targets::Display,
+    select: &Entity<TargetSelect>,
+    display_size: Size<Pixels>,
+    display_id: Option<gpui::DisplayId>,
+    focus: bool,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<OverlayWindow>> {
+    use gpui::layer_shell::{
+        Anchor, KeyboardInteractivity, Layer, LayerShellNotSupportedError, LayerShellOptions,
+    };
+
+    let display_bounds = Bounds {
+        origin: point(px(0.), px(0.)),
+        size: display_size,
+    };
+    let layer_shell_overlay = WindowKind::LayerShell(LayerShellOptions {
+        namespace: "cap-target-overlay".into(),
+        layer: Layer::Overlay,
+        anchor: Anchor::all(),
+        exclusive_zone: Some(px(-1.)),
+        keyboard_interactivity: if focus {
+            KeyboardInteractivity::Exclusive
+        } else {
+            KeyboardInteractivity::OnDemand
+        },
+        ..Default::default()
+    });
+    match open_overlay_window(
+        display,
+        select,
+        layer_shell_overlay,
+        WindowBounds::Windowed(display_bounds),
+        display_id,
+        cx,
+    ) {
+        Err(error) if error.is::<LayerShellNotSupportedError>() => open_overlay_window(
+            display,
+            select,
+            WindowKind::PopUp,
+            WindowBounds::Fullscreen(display_bounds),
+            display_id,
+            cx,
+        ),
+        result => result,
+    }
+}
+
+fn open_overlay_window(
+    display: &scap_targets::Display,
+    select: &Entity<TargetSelect>,
+    kind: WindowKind,
+    window_bounds: WindowBounds,
+    display_id: Option<gpui::DisplayId>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<OverlayWindow>> {
+    let display = *display;
+    let select = select.clone();
+    cx.open_window(
+        WindowOptions {
+            // The origin is corrected right after opening -- gpui's own
+            // window-origin math cannot express "cover this display" (see
+            // `platform::set_window_frame_cg`). The size is honoured, and it is
+            // the size the renderer is built for.
+            window_bounds: Some(window_bounds),
+            display_id,
+            titlebar: None,
+            // `NSWindowStyleMaskNonActivatingPanel` in windows.rs: the overlay
+            // takes clicks without activating the app over the one being
+            // recorded.
+            kind,
+            focus: false,
+            // Shown once it has been moved onto its display, so it never
+            // paints a frame in the wrong place.
+            show: false,
+            is_resizable: false,
+            is_minimizable: false,
+            window_background: gpui::WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        },
+        move |window, cx| cx.new(|cx| OverlayWindow::new(&display, select, window, cx)),
+    )
 }
 
 fn close_overlay(id: &DisplayId, cx: &mut App) {
